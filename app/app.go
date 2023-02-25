@@ -15,16 +15,19 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/google/go-github/v43/github"
 )
 
 const (
 	inProgress      = "in_progress"
 	buildifierCheck = "buildifier"
+	buildifierFix   = "buildifier-fix"
 	nogoCheck       = "bazel"
 )
 
@@ -141,6 +144,8 @@ func (app *GithubApp) HandleWebhook(w http.ResponseWriter, req *http.Request) {
 				err = app.InitCheckRun(ctx, e)
 			case "rerequested":
 				err = app.CreateCheckRuns(ctx, e.Installation.GetID(), e.GetRepo(), e.CheckRun.GetHeadSHA())
+			case "requested_action":
+				err = app.TakeRequestedAction(ctx, e)
 			}
 		}
 	}
@@ -173,7 +178,11 @@ func (app *GithubApp) InitCheckRun(ctx context.Context, event *github.CheckRunEv
 	// Run a test
 	dir := getTmpDir(fullRepoName, checkName)
 
-	err = app.cloneRepo(ctx, fullRepoName, installationID, headSHA, dir)
+	ref := GitRef{
+		hash: headSHA,
+	}
+
+	_, err = app.cloneRepo(ctx, fullRepoName, installationID, ref, dir)
 	if err != nil {
 		return fmt.Errorf("failed to clone repo: %s", err)
 	}
@@ -199,6 +208,51 @@ func (app *GithubApp) InitCheckRun(ctx context.Context, event *github.CheckRunEv
 	err = os.RemoveAll(dir)
 	if err != nil {
 		log.Printf("failed to cleanup dir %q: %s", dir, err)
+	}
+	return nil
+}
+
+func (app *GithubApp) TakeRequestedAction(ctx context.Context, event *github.CheckRunEvent) error {
+	installationID := event.Installation.GetID()
+	fullRepoName := event.Repo.GetFullName()
+	headBranch := event.CheckRun.CheckSuite.GetHeadBranch()
+
+	if event.RequestedAction.Identifier == buildifierFix {
+		dir := getTmpDir(fullRepoName, buildifierFix)
+		ref := GitRef{
+			branch: headBranch,
+		}
+		r, err := app.cloneRepo(ctx, fullRepoName, installationID, ref, dir)
+		if err != nil {
+			return fmt.Errorf("failed to clone repo: %s", err)
+		}
+		_, _, err = runCmd("buildifier", "--mode=check", "-r", dir)
+		if err != nil {
+			return err
+		}
+		w, err := r.Worktree()
+		if err != nil {
+			return fmt.Errorf("failed to get work tree: %s", err)
+		}
+		commit, err := w.Commit("Fix BUILD lint errors.", &git.CommitOptions{
+			All: true,
+			Author: &object.Signature{
+				Name:  "Lulu's Code Review Bot",
+				Email: "lulu@luluz.club",
+				When:  time.Now(),
+			},
+		})
+		if err != nil {
+			return errors.New("unable to create commit")
+		}
+		err = r.Push(&git.PushOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to push %q", commit)
+		}
+		err = os.RemoveAll(dir)
+		if err != nil {
+			log.Printf("failed to cleanup dir %q: %s", dir, err)
+		}
 	}
 	return nil
 }
@@ -229,6 +283,15 @@ func createCompletedUpdateCheckRunOptions(result *Result, checkName string) gith
 	}
 	if result.URL != "" {
 		opts.DetailsURL = github.String(result.URL)
+	}
+	if action := result.Action; action != nil {
+		opts.Actions = []*github.CheckRunAction{
+			{
+				Label:       action.Label,
+				Description: action.Description,
+				Identifier:  action.Identifier,
+			},
+		}
 	}
 	return opts
 }
@@ -265,10 +328,15 @@ func writeError(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), statusCode)
 }
 
-func (app *GithubApp) cloneRepo(ctx context.Context, fullRepoName string, installationID int64, headSHA string, targetDir string) error {
+type GitRef struct {
+	hash   string
+	branch string
+}
+
+func (app *GithubApp) cloneRepo(ctx context.Context, fullRepoName string, installationID int64, ref GitRef, targetDir string) (*git.Repository, error) {
 	token, err := app.Token(ctx, installationID)
 	if err != nil {
-		return fmt.Errorf("failed to get token: %s", err)
+		return nil, fmt.Errorf("failed to get token: %s", err)
 	}
 	url := fmt.Sprintf("https://x-access-token:%s@github.com/%s.git", token, fullRepoName)
 	r, err := git.PlainCloneContext(ctx, targetDir, false, &git.CloneOptions{
@@ -276,29 +344,34 @@ func (app *GithubApp) cloneRepo(ctx context.Context, fullRepoName string, instal
 		Progress: os.Stdout,
 	})
 	if err != nil {
-		return fmt.Errorf("unable to clone repo to %q: %s", targetDir, err)
+		return nil, fmt.Errorf("unable to clone repo to %q: %s", targetDir, err)
 	}
 
 	w, err := r.Worktree()
 	if err != nil {
-		return fmt.Errorf("failed to get work tree: %s", err)
+		return nil, fmt.Errorf("failed to get work tree: %s", err)
 	}
 
 	err = w.Pull(&git.PullOptions{})
 
 	if err != nil && err != git.NoErrAlreadyUpToDate {
-		return fmt.Errorf("failed to pull: %s", err)
+		return nil, fmt.Errorf("failed to pull: %s", err)
 	}
 
-	err = w.Checkout(&git.CheckoutOptions{
-		Hash:  plumbing.NewHash(headSHA),
+	opts := &git.CheckoutOptions{
 		Force: true,
-	})
+	}
+	if ref.hash != "" {
+		opts.Hash = plumbing.NewHash(ref.hash)
+	} else if ref.branch != "" {
+		opts.Branch = plumbing.NewBranchReferenceName(ref.branch)
+	}
+	err = w.Checkout(opts)
 	if err != nil {
-		return fmt.Errorf("failed to checkout %q: %s", headSHA, err)
+		return nil, fmt.Errorf("failed to checkout %v: %s", opts, err)
 	}
 
-	return nil
+	return r, nil
 }
 
 func runCmd(toolName string, arg ...string) (bytes.Buffer, bytes.Buffer, error) {
@@ -324,6 +397,13 @@ type Result struct {
 	Conclusion  string
 	Annotations []*Annotation
 	URL         string
+	Action      *Action
+}
+
+type Action struct {
+	Label       string
+	Description string
+	Identifier  string
 }
 
 type Annotation struct {
@@ -372,6 +452,11 @@ func checkBuildifier(_ *GithubApp, dir string) (*Result, error) {
 		res.Summary = fmt.Sprintf("%d BUILD files need reformat", len(annotations))
 		res.Conclusion = "failure"
 		res.Annotations = annotations
+		res.Action = &Action{
+			Label:       "Fix this",
+			Description: "Automatically fix buildifier errors.",
+			Identifier:  buildifierFix,
+		}
 	}
 	return res, nil
 }

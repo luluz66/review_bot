@@ -9,6 +9,7 @@ go_library(
         "@com_github_bradleyfalzon_ghinstallation_v2//:ghinstallation",
         "@com_github_go_git_go_git_v5//:go-git",
         "@com_github_go_git_go_git_v5//plumbing",
+        "@com_github_go_git_go_git_v5//plumbing/object",
         "@com_github_google_go_github_v43//github",
     ],
 )
