@@ -228,10 +228,10 @@ func (app *GithubApp) TakeRequestedAction(ctx context.Context, event *github.Che
 			return fmt.Errorf("failed to clone repo: %s", err)
 		}
 		defer func() {
-			//err = os.RemoveAll(dir)
-			//if err != nil {
-			//	log.Printf("failed to cleanup dir %q: %s", dir, err)
-			//}
+			err = os.RemoveAll(dir)
+			if err != nil {
+				log.Printf("failed to cleanup dir %q: %s", dir, err)
+			}
 		}()
 		//hack.. git push https://x-access-token:#{@installation_token.to_s}@github.com/#{full_repo_name}.git
 		token, err := app.Token(ctx, installationID)
@@ -260,7 +260,7 @@ func (app *GithubApp) TakeRequestedAction(ctx context.Context, event *github.Che
 		}
 
 		log.Println("Creating commit")
-		_, stdErr, err = runCmd("git", "commit", "-a", "-m", "'Fix BUILD lint errors'", "--author", "'Lulu Code Review Bot <lulu@luluz.club>'")
+		_, stdErr, err = runCmd("git", "commit", "-a", "-m", `Fix BUILD lint errors`, "--author", `Lulu's Code Review Bot <lulu@luluz.club>`)
 		if stdErr.Len() != 0 {
 			log.Println(stdErr.String())
 		}
