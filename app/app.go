@@ -199,9 +199,6 @@ func (app *GithubApp) InitCheckRun(ctx context.Context, event *github.CheckRunEv
 	if err != nil {
 		return fmt.Errorf("failed to run %s: %s", checkName, err)
 	}
-	if result == nil {
-		return fmt.Errorf("failed to run %s", checkName)
-	}
 	opts = createCompletedUpdateCheckRunOptions(result, checkName)
 	updateRun, res, err = ghc.Checks.UpdateCheckRun(ctx, owner, repo, id, opts)
 	if err := extractError(ctx, res, err); err != nil {
@@ -446,15 +443,19 @@ type Annotation struct {
 // a diff detailing what's wrong with the file to stdout and returns an error.
 func checkBuildifier(_ *GithubApp, dir string) (*Result, error) {
 	_, stdErr, err := runCmd("buildifier", "--mode=check", "-r", dir)
+	res := &Result{
+		Title: "Buildifier Lint Result",
+	}
 	if stdErr.Len() == 0 {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		res.Summary = "No issues found."
+		res.Conclusion = "success"
 	}
 
 	scanner := bufio.NewScanner(&stdErr)
 	annotations := []*Annotation{}
-	res := &Result{
-		Title: "Buildifier Lint Result",
-	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -474,10 +475,7 @@ func checkBuildifier(_ *GithubApp, dir string) (*Result, error) {
 		}
 	}
 
-	if len(annotations) == 0 {
-		res.Summary = "No issues found."
-		res.Conclusion = "success"
-	} else {
+	if len(annotations) > 0 {
 		res.Summary = fmt.Sprintf("%d BUILD files need reformat", len(annotations))
 		res.Conclusion = "failure"
 		res.Annotations = annotations
@@ -486,6 +484,9 @@ func checkBuildifier(_ *GithubApp, dir string) (*Result, error) {
 			Description: "Automatically fix buildifier errors.",
 			Identifier:  buildifierFix,
 		}
+	} else {
+		res.Summary = "No issues found."
+		res.Conclusion = "success"
 	}
 	return res, nil
 }
